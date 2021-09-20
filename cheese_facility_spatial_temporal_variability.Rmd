@@ -1,0 +1,1010 @@
+---
+title: "Temporal and geographic variability in the cheese facility microbiome"
+author: "Jared Johnson"
+date: "10/13/2020"
+output: html_document
+---
+
+#1. Loading Libraries
+```{r}
+library(decontam) # removal of sequence contaminaion
+library(phyloseq) # data analysis
+library(qiime2R) # import QIIME2 artifacts
+library(tidyverse) # data formatting
+library(vegan) # data analysis
+library(ggsci) # colors for ggplot2
+library(microbiome) # core microbiome analysis
+library(ggpubr) # used with ggplot2 to make figures
+library(kableExtra) # for making publish-quality data tables.
+library(ranacapa) # rarefaction curves for ggplot2
+library(scales)
+library(ggrepel) # for ggplot labeling
+library(patchwork) # creating multipanel figures
+library(ggh4x) # for creating nested facets
+```
+
+#2. General Functions
+```{r}
+# feature_level adds a column with highest feature-level taxonomic identification for each sequence
+feature_level <- function(x){
+  
+  rnd1 <- subset(x, x$Genus != " g__" & !is.na(x$Genus))
+  genus <- as.data.frame(rnd1$Feature.ID)
+  genus$Feature <- rnd1$Genus
+  colnames(genus)[1] <- "Feature.ID"
+
+  rnd2 <- anti_join(x, genus, by = "Feature.ID")
+  rnd2 <- subset(rnd2, rnd2$Family != " f__")
+  family <- as.data.frame(rnd2$Feature.ID)
+  family$Feature <- rnd2$Family
+  colnames(family)[1] <- "Feature.ID"
+  
+  comb <- rbind(genus, family)
+  
+  rnd3 <- anti_join(x, comb, by = "Feature.ID")
+  rnd3 <- subset(rnd3, rnd3$Order != " o__" & !is.na(rnd3$Order))
+  order <- as.data.frame(rnd3$Feature.ID)
+  order$Feature <- rnd3$Order
+  colnames(order)[1] <- "Feature.ID"
+  
+  comb <- rbind(comb, order)
+  
+  rnd4 <- anti_join(x, comb, by = "Feature.ID")
+  rnd4 <- subset(rnd4, rnd4$Class != " c__" & !is.na(rnd4$Class))
+  class <- as.data.frame(rnd4$Feature.ID)
+  class$Feature <- rnd4$Class
+  colnames(class)[1] <- "Feature.ID"
+  
+  comb <- rbind(comb, class)
+  
+  rnd5 <- anti_join(x, comb, by = "Feature.ID")
+  rnd5 <- subset(rnd5, rnd5$Phylum != " p__" & !is.na(rnd5$Phylum))
+  phylum <- as.data.frame(rnd5$Feature.ID)
+  phylum$Feature <- rnd5$Phylum
+  colnames(phylum)[1] <- "Feature.ID"
+  
+  comb <- rbind(comb, phylum)
+  
+  rnd6 <- anti_join(x, comb, by = "Feature.ID")
+  rnd6 <- subset(rnd6, rnd6$Kingdom != " k__" & !is.na(rnd6$Kingdom))
+  kingdom <- as.data.frame(rnd6$Feature.ID)
+  kingdom$Feature <- rnd6$Kingdom
+  colnames(kingdom)[1] <- "Feature.ID"
+  
+  comb <- rbind(comb, kingdom)
+  
+  comb <- merge(x, comb, by = "Feature.ID")
+  
+  return(comb)
+}
+
+
+```
+
+
+
+#3. Importing QIIME2 Artifacts & Making Phyloseq Object (uses qiime2R)
+QIIME2 artificats are loaded in to R using qiime2R and then converted into the appropriate formats to be merged into a single Phyloseq object.
+
+```{r}
+# frequency table
+freq_table <- read_qza("~/OneDrive - Oregon State University/r_code/variability_study/qiime2_artifacts/table_filter1.qza")
+
+# taxonomy table (extra code splits string of taxa)
+taxonomy <- read_qza("~/OneDrive - Oregon State University/r_code/variability_study/qiime2_artifacts/taxonomy_filter1.qza")
+taxa <- taxonomy$data %>% separate(Taxon, c("Kingdom","Phylum","Class","Order","Family","Genus","Species"), sep=";")
+taxa <- feature_level(taxa)
+taxa$Feature <- gsub(".*__","",taxa$Feature)
+taxa$SV <- paste("SV", 1:nrow(taxa), sep="")
+
+# Metadata table (not QIIME2 artifact); turn categorical variable into factors for merging samples in later steps.
+metadata <- read_tsv("~/OneDrive - Oregon State University/r_code/variability_study/qiime2_artifacts/metadata_all.txt")
+metadata$type <- factor(metadata$type, levels = c("milk", "belt", "cheese", "milk_pma"))
+levels(metadata$type) <- c("Milk", "Belt", "Cheese", "Milk_PMA")
+metadata$facility <- factor(metadata$facility, levels=c("Tillamook", "Boardman_2", "Boardman_1"))
+levels(metadata$facility) <- c("Facility A", "Facility B", "Facility C")
+metadata$location <- factor(metadata$location, levels=c("raw_milk", "heat-shock_milk", "vat_milk", "drain_belt", "belt_1", "belt_2", "matted_curd", "salter_belt", "pressed_cheese", "raw_milk_PMA"))
+levels(metadata$location) <- c("Raw Milk", "Thermized Milk", "Vat Milk", "Upper DMC Belt", "Middle DMC Belt", "Lower DMC Belt", "Matted Curd", "Salting Belt", "Pressed Cheese", "PMA Milk")
+metadata$time <- factor(metadata$time, levels=c("start", "middle", "end"))
+levels(metadata$time) <- c("Start", "Middle", "End")
+
+metadata$facility.day <- paste(metadata$facility, metadata$day_char, sep = "-") %>% as.factor()
+metadata$facility.day.location <- as.factor(metadata$facility.day.location)
+metadata$facility.day.location.time.rep <- paste(metadata$facility, metadata$day_char, metadata$location, metadata$time, metadata$replicate, sep = "-")
+
+
+# Phyloseq object (extra code converts data to phyloseq compatible format)
+
+ps <- phyloseq(otu_table(freq_table$data, taxa_are_rows = T), tax_table(as.data.frame(taxa) %>% select(-Confidence) %>% column_to_rownames("Feature.ID") %>% as.matrix()), sample_data(metadata %>% as.data.frame() %>% column_to_rownames("#SampleID")))
+
+write.csv(metadata, file = "~/OneDrive - Oregon State University/r_code/variability_study/metadata.csv")
+
+```
+
+#4. Removing Contamination using Decontam
+## Overview
+Contaminant sequences are removed using the Decontam package. General workflow is based on https://benjjneb.github.io/decontam/vignettes/decontam_intro.html
+
+## Inspect Library Size
+```{r}
+# Samples vs Controls
+df <- data.frame(sample_data(ps)) # Put sample_data into a ggplot-friendly data.frame
+df$LibrarySize <- sample_sums(ps)
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=sample_or_control)) + geom_point()
+
+# Library Size by Sample Type
+## subset samples included in study
+df.samples <- df %>% subset(type == "Milk" | type == "Belt" | type == "Cheese")
+## plot library sizes by sample type
+p_lib.all <- ggplot(data=df.samples, aes(x=Index, y=LibrarySize, color=type))+geom_point()+theme_pubr()+theme(legend.position="right")
+ggsave(filename = "libsize_all.png", plot = p_lib.all, path = "~/OneDrive - Oregon State University/r_code/variability_study/figures/decontam", height = 3, width = 5)
+## summarize libraries by sample type
+summary(df.samples[df.samples$type == "Milk",]$LibrarySize)
+summary(df.samples[df.samples$type == "Belt",]$LibrarySize)
+summary(df.samples[df.samples$type == "Cheese",]$LibrarySize)
+## Conclusion: Milk samples have smaller library sizes and should be treated separately from belt and cheese samples.
+p_lib.milk <- ggplot(data=df[df$type == "Milk",], aes(x=Index, y=LibrarySize, color=location))+geom_point()+theme_pubr()+theme(legend.position="right")
+ggsave(filename = "libsize_milk.png", plot = p_lib.milk, path = "~/OneDrive - Oregon State University/r_code/variability_study/figures/decontam", height = 3, width = 5)
+```
+
+## Remove Decontam by Prevalence Method
+### Determining score statistic threshold (P*).
+```{r}
+# create a new column containing info about if the sample is a control or not (TRUE=control, FALSE=sample). This is used by the prevalence-based method.
+sample_data(ps)$is.neg <- sample_data(ps)$sample_or_control == "control"
+
+# run decontam method "prevalence" with threshold at max (i.e. 1.0)
+contamdf.prev.max <- isContaminant(ps, method="prevalence", neg="is.neg", threshold = 1)
+
+# create a table contaning contaminant IDs and taxonomy for assessment of contaminants
+contam.prev.max <- rownames_to_column(contamdf.prev.max[contamdf.prev.max$contaminant == "TRUE",], "Feature.ID") %>% merge(taxa)
+View(contam.prev.max)
+# Assess P scores visually to determine cut-off. Then find cut-off in count table. A threshold of 0.495 was chosen for this data.
+p.scores <- table(contamdf.prev.max$p.prev) %>% data.frame() %>% rename(p.prev = Var1) %>% rename(p.prev.count = Freq)
+
+p <- ggplot(contam.prev.max, aes(x=p.prev))+geom_histogram()+
+  labs(x="decontam Score", y= "Number SVs")+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"), strip.text.y.left = element_text(angle = 0))
+p
+
+ggsave(filename = "decontam_scores.png", path = "~/OneDrive - Oregon State University/r_code/variability_study/figures/decontam", plot = p, width = 5, height = 3.5, dpi = 300)
+```
+
+### Remove contaminants using the determined threshold.
+```{r}
+# run decontam method 'either' which includes samples identified as contaminant by either the prevelance or frequency methods.
+contamdf.prev <- isContaminant(ps, method="prevalence", neg="is.neg", threshold = 0.495)
+
+# create a table contaning contaminant IDs and taxonomy for assessment of contaminants
+contam.prev <- rownames_to_column(contamdf.prev[contamdf.prev$contaminant == "TRUE",], "Feature.ID") %>% merge(taxa)
+contam.prev$Feature.SV <- paste(contam.prev$Feature, contam.prev$SV, sep = "-")
+view(contam.prev)
+
+# assess prevalence-based contaminants by visually checking prevalence in controls and samples
+pres_abs <- function(x,y){
+  ps.pa <- transform_sample_counts(x, function(abund) 1*(abund>0))
+  ps.pa.neg <- prune_samples(sample_data(ps.pa)$sample_or_control == "control", ps.pa)
+  ps.pa.pos <- prune_samples(sample_data(ps.pa)$sample_or_control == "sample", ps.pa)
+  df.pa <- data.frame(pa.pos=taxa_sums(ps.pa.pos), pa.neg=taxa_sums(ps.pa.neg),
+                      contaminant=y$contaminant)
+  p <- ggplot(data=df.pa, aes(x=pa.neg, y=pa.pos, color=contaminant)) + geom_point() +
+  xlab("Prevalence (Negative Controls)") + ylab("Prevalence (True Samples)")
+
+  return(p)
+}
+
+p_prev <- pres_abs(ps, contamdf.prev)
+p_prev
+```
+
+
+### Remove Contaminants from Phyloseq Object
+```{r}
+# be sure to update the name of the decontam table
+ps.decon <- prune_taxa(!contamdf.prev$contaminant, ps)
+sample_data(ps.decon)$dna_conc <- NULL
+sample_data(ps.decon)$is.neg <- NULL
+
+# subset table to only include 'End Day' samples
+ps.decon.end <- subset_samples(ps.decon, time=="End")
+
+# remove PMA-treated samples
+ps.decon.end.no_PMA <- subset_samples(ps.decon.end, type != "Milk_PMA")
+
+# By Sample Type
+ps.milk <- subset_samples(ps.decon.end.no_PMA, type == "Milk")
+ps.belts <- subset_samples(ps.decon.end.no_PMA, type == "Belt")
+ps.cheese <- subset_samples(ps.decon.end.no_PMA, type == "Cheese")
+
+# By Location and Facility
+ps.raw <- subset_samples(ps.milk, location=="Raw Milk")
+ps.raw.A <- subset_samples(ps.raw, facility == "Facility A")
+ps.raw.B <- subset_samples(ps.raw, facility == "Facility B")
+ps.raw.C <- subset_samples(ps.raw, facility == "Facility C")
+
+ps.hs_milk <- subset_samples(ps.milk, location=="Thermized Milk")
+ps.hs_milk.A <- subset_samples(ps.hs_milk, facility == "Facility A")
+ps.hs_milk.B <- subset_samples(ps.hs_milk, facility == "Facility B")
+ps.hs_milk.C <- subset_samples(ps.hs_milk, facility == "Facility C")
+
+ps.vat <- subset_samples(ps.milk, location=="Vat Milk")
+ps.vat.A <- subset_samples(ps.vat, facility == "Facility A")
+ps.vat.B <- subset_samples(ps.vat, facility == "Facility B")
+ps.vat.C <- subset_samples(ps.vat, facility == "Facility C")
+
+ps.drain <- subset_samples(ps.belts, location=="Upper DMC Belt")
+ps.drain.A <- subset_samples(ps.drain, facility == "Facility A")
+ps.drain.B <- subset_samples(ps.drain, facility == "Facility B")
+ps.drain.C <- subset_samples(ps.drain, facility == "Facility C")
+
+ps.belt1 <- subset_samples(ps.belts, location=="Middle DMC Belt")
+ps.belt1.A <- subset_samples(ps.belt1, facility == "Facility A")
+ps.belt1.B <- subset_samples(ps.belt1, facility == "Facility B")
+ps.belt1.C <- subset_samples(ps.belt1, facility == "Facility C")
+
+ps.belt2 <- subset_samples(ps.belts, location=="Lower DMC Belt")
+ps.belt2.A <- subset_samples(ps.belt2, facility == "Facility A")
+ps.belt2.B <- subset_samples(ps.belt2, facility == "Facility B")
+ps.belt2.C <- subset_samples(ps.belt2, facility == "Facility C")
+
+ps.salter <- subset_samples(ps.belts, location=="Salting Belt")
+ps.salter.A <- subset_samples(ps.salter, facility == "Facility A")
+ps.salter.B <- subset_samples(ps.salter, facility == "Facility B")
+ps.salter.C <- subset_samples(ps.salter, facility == "Facility C")
+
+ps.pressed_cheese <- subset_samples(ps.cheese, location == "Pressed Cheese")
+ps.pressed_cheese.A <- subset_samples(ps.pressed_cheese, facility == "Facility A")
+ps.pressed_cheese.B <- subset_samples(ps.pressed_cheese, facility == "Facility B")
+ps.pressed_cheese.C <- subset_samples(ps.pressed_cheese, facility == "Facility C")
+
+ps.matted_curd <- subset_samples(ps.cheese, location == "Matted Curd")
+ps.matted_curd.A <- subset_samples(ps.matted_curd, facility == "Facility A")
+ps.matted_curd.B <- subset_samples(ps.matted_curd, facility == "Facility B")
+ps.matted_curd.C <- subset_samples(ps.matted_curd, facility == "Facility C")
+
+# subset by DMC belts
+ps.DMC <- subset_samples(ps.belts, location != "Salting Belt")
+
+```
+
+## Inspect Library Size - Post-Decontam
+```{r}
+# Samples vs Controls
+df <- data.frame(sample_data(ps.decon)) # Put sample_data into a ggplot-friendly data.frame
+df$LibrarySize <- sample_sums(ps.decon)
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=sample_or_control)) + geom_point()
+
+# Library Size by Sample Type
+## subset samples included in study
+df.decon <- df %>% subset(type == "Milk" | type == "Belt" | type == "Cheese")
+## plot library sizes by sample type
+p_lib.all <- ggplot(data=df.decon, aes(x=Index, y=LibrarySize, color=type))+geom_point()+theme_pubr()+theme(legend.position="right")
+
+## summarize libraries by sample type
+summary(df.decon[df.decon$type == "Milk",]$LibrarySize)
+summary(df.decon[df.decon$type == "Belt",]$LibrarySize)
+summary(df.decon[df.decon$type == "Cheese",]$LibrarySize)
+## Conclusion: Milk samples have smaller library sizes and should be treated separately from belt and cheese samples.
+p_lib.milk <- ggplot(data=df[df$type == "milk",], aes(x=Index, y=LibrarySize, color=location))+geom_point()+theme_pubr()+theme(legend.position="right")
+
+```
+
+
+#5. Alpha Diveristy
+## Rarefaction Curves
+```{r}
+p_rare.all <- ggrare(ps.decon.end.no_PMA, step = 50, se = FALSE)
+
+rare.level <- data.frame(location = c("Raw Milk", "Thermized Milk", "Vat Milk", "Upper DMC Belt", "Middle DMC Belt", "Lower DMC Belt", "Matted Curd", "Salting Belt", "Pressed Cheese"), rare_level = c(593, 593, 593, 29467, 29467, 29467, 29467, 52372, 52372))
+rare.level$location <- factor(rare.level$location, levels = rare.level$location)
+
+p_rare.all <- p_rare.all+
+  geom_vline(data = rare.level, aes(xintercept = rare_level), color = "red")+
+  facet_wrap("location", scales = "free")+scale_x_continuous(labels = scientific)+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"))+labs(x="Sequencing Depth (Reads per Sample)", y="Species Richness (SVs per Sample)")
+
+ggsave("supplementary_figure_2.tiff", plot=p_rare.all, width = 6, height = 6, dpi = 300, path = "~/OneDrive - Oregon State University/papers/variability_paper/for_publication/figures/main/")
+```
+
+## Shannon's Alpha Diveristy
+### Shannon's Alpha Diveristy - Plots
+```{r}
+alpha.est <- function(x, index = "shannon", sample.size = 593, seed = 11){
+  x.rar <- rarefy_even_depth(x, sample.size = sample.size, rngseed = seed)
+  meta <- meta(x.rar)
+  otu <- abundances(x.rar)
+  div <- vegan::diversity(t(otu), index = index)
+  div <- cbind(div,meta)
+  
+  return(div)
+}
+
+# dataframes
+alpha.milk <- prune_samples(sample_names(ps.milk) != "B64", ps.milk) %>% alpha.est(index = "shannon", sample.size = 593, seed = 11)
+alpha.belts <- alpha.est(ps.belts, index = "shannon", sample.size = 29467, seed = 11)
+alpha.cheese <- alpha.est(ps.cheese, index = "shannon", sample.size = 52372, seed = 11)
+alpha.all <- rbind(alpha.milk,alpha.belts,alpha.cheese)
+
+# plots
+p_alpha.milk <- ggplot(alpha.milk, aes(x=facility.day, y=div, color = facility))+geom_boxplot()+
+  facet_wrap("location", nrow = 1)+
+  labs(x = "", y = "", color = "Facility")+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(),panel.border = element_rect(colour = "black", fill=NA))+
+    scale_color_manual(values = c("#595959","#E84A2C", "#48BBD7"))+
+    scale_x_discrete(name = "", labels = c("D1", "D2", "D3", "D1", "D2", "D3", "D2", "D3"))+scale_y_continuous(labels = number_format(accuracy = 0.1))
+p_alpha.belts <- ggplot(alpha.all[alpha.all$type == "Belt" & alpha.all$location != "Salting Belt",], aes(x=facility.day, y=div, color = facility))+geom_boxplot()+
+  facet_wrap("location", nrow = 1)+
+  labs(x = "", y = "", color = "Facility")+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(),panel.border = element_rect(colour = "black", fill=NA))+
+    scale_color_manual(values = c("#595959","#E84A2C", "#48BBD7"))+
+    scale_x_discrete(name = "", labels = c("D1", "D2", "D3", "D1", "D2", "D3", "D2", "D3"))+scale_y_continuous(name = "Shannon's Alpha Diversity", labels = number_format(accuracy = 0.1))
+p_alpha.cheese <- ggplot(alpha.all[alpha.all$type == "Cheese" | alpha.all$location == "Salting Belt",], aes(x=facility.day, y=div, color = facility))+geom_boxplot()+
+  facet_wrap("location", nrow = 1)+
+  labs(x = "", y = "", color = "Facility")+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(),panel.border = element_rect(colour = "black", fill=NA))+
+    scale_color_manual(values = c("#595959","#E84A2C", "#48BBD7"))+
+    scale_x_discrete(name = "Production Day", labels = c("D1", "D2", "D3", "D1", "D2", "D3", "D2", "D3"))+scale_y_continuous(labels = number_format(accuracy = 0.1))
+
+p_alpha <- p_alpha.milk / p_alpha.belts / p_alpha.cheese + plot_layout(guides = "collect")
+
+ggsave(filename = "figure_2.tiff", plot = p_alpha, path = "~/OneDrive - Oregon State University/papers/variability_paper/for_publication/figures/main/", height = 6, width = 6, dpi = 300)
+```
+
+### Shannon's Alpha Diveristy - Hypothesis Testing
+```{r}
+# Summaries
+alpha.milk %>% group_by(facility, location) %>% summarise(mean = mean(div), sd = sd(div), median = median(div))
+alpha.belts %>% group_by(facility, location) %>% summarise(mean = mean(div), sd = sd(div), median = median(div)) 
+alpha.cheese %>% group_by(facility, location) %>% summarise(mean = mean(div), sd = sd(div), median = median(div)) 
+
+
+# Milk
+kruskal.test(div~facility, data = alpha.milk[alpha.milk$location == "Raw Milk",])
+kruskal.test(div~facility, data = alpha.milk[alpha.milk$location == "Thermized Milk",])
+kruskal.test(div~facility, data = alpha.milk[alpha.milk$location == "Vat Milk",])
+
+## Day
+
+kruskal.test(div~day_char, data = alpha.milk[alpha.milk$facility == "Facility A" & alpha.milk$location == "Raw Milk",])
+kruskal.test(div~day_char, data = alpha.milk[alpha.milk$facility == "Facility B" & alpha.milk$location == "Raw Milk",])
+kruskal.test(div~day_char, data = alpha.milk[alpha.milk$facility == "Facility C" & alpha.milk$location == "Raw Milk",])
+
+kruskal.test(div~day_char, data = alpha.milk[alpha.milk$facility == "Facility A" & alpha.milk$location == "Thermized Milk",])
+kruskal.test(div~day_char, data = alpha.milk[alpha.milk$facility == "Facility B" & alpha.milk$location == "Thermized Milk",])
+kruskal.test(div~day_char, data = alpha.milk[alpha.milk$facility == "Facility C" & alpha.milk$location == "Thermized Milk",])
+
+kruskal.test(div~day_char, data = alpha.milk[alpha.milk$facility == "Facility A" & alpha.milk$location == "Vat Milk",])
+kruskal.test(div~day_char, data = alpha.milk[alpha.milk$facility == "Facility B" & alpha.milk$location == "Vat Milk",])
+kruskal.test(div~day_char, data = alpha.milk[alpha.milk$facility == "Facility C" & alpha.milk$location == "Vat Milk",])
+
+
+# Belts
+kruskal.test(div~facility, data = alpha.belts[alpha.belts$location == "Upper DMC Belt",])
+kruskal.test(div~facility, data = alpha.belts[alpha.belts$location == "Middle DMC Belt",])
+kruskal.test(div~facility, data = alpha.belts[alpha.belts$location == "Lower DMC Belt",])
+kruskal.test(div~facility, data = alpha.belts[alpha.belts$location == "Salting Belt",])
+
+## Day
+kruskal.test(div~day_char, data = alpha.belts[alpha.belts$facility == "Facility A" & alpha.belts$location == "Upper DMC Belt",])
+kruskal.test(div~day_char, data = alpha.belts[alpha.belts$facility == "Facility B" & alpha.belts$location == "Upper DMC Belt",])
+kruskal.test(div~day_char, data = alpha.belts[alpha.belts$facility == "Facility C" & alpha.belts$location == "Upper DMC Belt",])
+
+kruskal.test(div~day_char, data = alpha.belts[alpha.belts$facility == "Facility A" & alpha.belts$location == "Middle DMC Belt",])
+kruskal.test(div~day_char, data = alpha.belts[alpha.belts$facility == "Facility B" & alpha.belts$location == "Middle DMC Belt",])
+kruskal.test(div~day_char, data = alpha.belts[alpha.belts$facility == "Facility C" & alpha.belts$location == "Middle DMC Belt",])
+
+kruskal.test(div~day_char, data = alpha.belts[alpha.belts$facility == "Facility A" & alpha.belts$location == "Lower DMC Belt",])
+kruskal.test(div~day_char, data = alpha.belts[alpha.belts$facility == "Facility B" & alpha.belts$location == "Lower DMC Belt",])
+kruskal.test(div~day_char, data = alpha.belts[alpha.belts$facility == "Facility C" & alpha.belts$location == "Lower DMC Belt",])
+
+kruskal.test(div~day_char, data = alpha.belts[alpha.belts$facility == "Facility A" & alpha.belts$location == "Salting Belt",])
+kruskal.test(div~day_char, data = alpha.belts[alpha.belts$facility == "Facility B" & alpha.belts$location == "Salting Belt",])
+kruskal.test(div~day_char, data = alpha.belts[alpha.belts$facility == "Facility C" & alpha.belts$location == "Salting Belt",])
+
+# Cheese
+## Facility
+kruskal.test(div~facility, data = alpha.cheese[alpha.cheese$location == "Matted Curd",])
+kruskal.test(div~facility, data = alpha.cheese[alpha.cheese$location == "Pressed Cheese",])
+
+## Day
+kruskal.test(div~day_char, data = alpha.cheese[alpha.cheese$facility == "Facility A" & alpha.cheese$location == "Matted Curd",])
+kruskal.test(div~day_char, data = alpha.cheese[alpha.cheese$facility == "Facility B" & alpha.cheese$location == "Matted Curd",])
+kruskal.test(div~day_char, data = alpha.cheese[alpha.cheese$facility == "Facility C" & alpha.cheese$location == "Matted Curd",])
+
+kruskal.test(div~day_char, data = alpha.cheese[alpha.cheese$facility == "Facility A" & alpha.cheese$location == "Pressed Cheese",])
+kruskal.test(div~day_char, data = alpha.cheese[alpha.cheese$facility == "Facility B" & alpha.cheese$location == "Pressed Cheese",])
+kruskal.test(div~day_char, data = alpha.cheese[alpha.cheese$facility == "Facility C" & alpha.cheese$location == "Pressed Cheese",])
+
+```
+
+# Species richness
+```{r}
+fun <- function(milk, belt, cheese){
+  m.meta <- meta(milk) %>% rownames_to_column(var = "sample")
+  b.meta <- meta(belt) %>% rownames_to_column(var = "sample")
+  c.meta <- meta(cheese) %>% rownames_to_column(var = "sample")
+  
+  m <- rarefy_even_depth(milk, sample.size = 593, rngseed = 11) %>% estimate_richness(measures = "Observed")%>% rownames_to_column(var = "sample")
+  b <- rarefy_even_depth(belt, sample.size = 29467, rngseed = 11) %>% estimate_richness(measures = "Observed")%>% rownames_to_column(var = "sample")
+  c <- rarefy_even_depth(cheese, sample.size = 52372, rngseed = 11) %>% estimate_richness(measures = "Observed")%>% rownames_to_column(var = "sample")
+  
+  df <- rbind(merge(m, m.meta), merge(b, b.meta), merge(c, c.meta))
+  
+  return(df)
+}
+
+richness <- prune_samples(sample_names(ps.milk) != "B64", ps.milk) %>% fun(ps.belts, ps.cheese)
+```
+
+```{r}
+merge(alpha.all, richness) %>% group_by(facility, location) %>% summarise(richness = mean(Observed), shannon = mean(div)) %>% View
+```
+
+
+#6. Beta Diveristy
+## Principle Component Analysis of Aitchinson Diversity
+```{r}
+clr.pca <- function(x, option = 1){
+  ps.clean <- prune_taxa(taxa_sums(x)>0, x)
+  x.clr <- transform(ps.clean, transform = "clr")
+  otu <- abundances(x.clr)
+  meta <- meta(x.clr) %>% rownames_to_column(var = "sample")
+  pca <- prcomp(t(otu))
+  
+  pc.var <- round(100*(pca$sdev^2 / sum(pca$sdev^2)), digits = 1)
+  pc1 <- paste("PC1 ", "(", pc.var[1], "%)", sep = "")
+  pc2 <- paste("PC2 ", "(", pc.var[2], "%)", sep = "")
+  
+  pc.df <- data.frame(pca$x) %>% rownames_to_column(var="sample") %>% merge(meta)
+
+  if(option == 1){
+    centroids <- pc.df %>% group_by(facility) %>% summarise(centroid1 = mean(PC1), centroid2 = mean(PC2))
+    
+    pc.df <- pc.df %>% merge(centroids)
+    
+    p1 <- ggplot(pc.df)+ 
+    geom_segment(aes(x=PC1, y=PC2, xend=centroid1, yend=centroid2, color = facility), size=0.2)+
+    geom_point(aes(x=PC1, y=PC2, color = facility), size = 1)+ 
+    geom_point(aes(x=centroid1, y=centroid2, color = facility), size = 4)+
+    theme(plot.title = element_text(size = 13), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), panel.border = element_rect(color = "black", fill=NA))+ 
+    labs(color = "Facility", x = pc1, y = pc2)+ scale_color_manual(values = c("#595959","#E84A2C","#48BBD7"))
+    
+    return(p1)
+  }
+  if(option == 2){
+    centroids <- pc.df %>% group_by(facility.day.location) %>% summarise(centroid1 = mean(PC1), centroid2 = mean(PC2))
+    
+    pc.df <- pc.df %>% merge(centroids)
+    
+    p2 <- ggplot(pc.df)+ 
+    geom_segment(aes(x=PC1, y=PC2, xend=centroid1, yend=centroid2, color = facility), size=0.2)+
+    geom_point(aes(x=PC1, y=PC2, color = facility, shape = day_char), size = 1)+ 
+    geom_point(aes(x=centroid1, y=centroid2, color = facility, shape = day_char), size = 4)+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), panel.border = element_rect(color = "black", fill=NA))+ 
+    labs(color = "Facility", shape = "Day", x = pc1, y = pc2)+ scale_color_manual(values = c("#595959","#E84A2C","#48BBD7"))
+    return(p2)
+  }
+    if(option == 3){
+    centroids <- pc.df %>% group_by(location) %>% summarise(centroid1 = mean(PC1), centroid2 = mean(PC2))
+    
+    pc.df <- pc.df %>% merge(centroids)
+    
+    p3 <- ggplot(pc.df)+ 
+    geom_segment(aes(x=PC1, y=PC2, xend=centroid1, yend=centroid2, color = location), size=0.2)+
+    geom_point(aes(x=PC1, y=PC2, color = location), size = 2)+ 
+    geom_point(aes(x=centroid1, y=centroid2, color = location), size = 6)+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), panel.border = element_rect(color = "black", fill=NA))+ 
+    labs(color = "Sample Location", x = pc1, y = pc2)+
+      scale_color_manual(values=c("#F59B7C", "#E84A2C", "#D72400", "#8FD1C2", "#00A187", "#48BBD7", "#3B528A", "#FDC000", "#7D6144"), breaks = c("Raw Milk", "Thermized Milk", "Vat Milk", "Upper DMC Belt", "Middle DMC Belt", "Lower DMC Belt", "Salting Belt", "Matted Curd", "Pressed Cheese"))
+    return(p3)
+  }
+}
+
+# All Sample Locations
+p_all.ord <- prune_samples(sample_names(ps.decon.end.no_PMA) != "B64", ps.decon.end.no_PMA) %>% clr.pca(option = 3)
+p_all.ord
+
+prune_samples(sample_names(ps.decon.end.no_PMA) != "B64", ps.decon.end.no_PMA) %>% clr.pca(option = 1)
+
+ggsave("Figure_3.tiff", plot=p_all.ord, width=6, height=4, path = "~/OneDrive - Oregon State University/papers/variability_paper/for_publication/figures/main/")
+
+# Facility Centroids
+### Milk
+p_raw.ord <- clr.pca(ps.raw, option = 1)
+p_raw.ord+ ggtitle("Raw Milk")
+
+p_hs_milk.ord <- clr.pca(ps.hs_milk, option = 1)
+p_hs_milk.ord+ ggtitle("Thermized Milk")
+
+p_vat.ord <- prune_samples(sample_names(ps.vat) != "B64", ps.vat) %>% clr.pca(option = 1)
+p_vat.ord+ ggtitle("Vat Milk")
+
+# Belts
+p_drain.ord <- clr.pca(ps.drain, option = 1)
+p_drain.ord+ ggtitle("Drain Belt")
+
+p_belt1.ord <- clr.pca(ps.belt1, option = 1)
+p_belt1.ord+ ggtitle("Belt 1")
+
+p_belt2.ord <- clr.pca(ps.belt2, option = 1)
+p_belt2.ord+ ggtitle("Belt 2")
+
+p_salter.ord <- clr.pca(ps.salter, option = 1)
+p_salter.ord+ ggtitle("salter")
+
+# Cheese
+p_pressed_cheese.ord <- clr.pca(ps.pressed_cheese, option = 1)
+p_pressed_cheese.ord+ ggtitle("Pressed Cheese")
+
+p_matted_curd.ord <- clr.pca(ps.matted_curd, option = 1)
+p_matted_curd.ord+ ggtitle("Matted Curd")
+
+# Figures arranged for publication
+
+p_legend.ord <- p_matted_curd.ord+guides(shape = guide_legend(override.aes = list(size = 8)), color = guide_legend(override.aes = list(size = 8)))+theme(legend.text=element_text(size=17), legend.title = element_text(size=25))
+
+p_comb.ord <- (p_raw.ord+ggtitle("Raw Milk") + p_hs_milk.ord+ggtitle("Thermized Milk") + p_vat.ord+ggtitle("Vat Milk")) / (p_drain.ord+ggtitle("Upper DMC Belt") + p_belt1.ord+ggtitle("Middle DMC Belt") + p_belt2.ord+ggtitle("Lower DMC Belt")) / (p_salter.ord+ggtitle("Salting Belt") + p_matted_curd.ord+ggtitle("Matted Curd") + p_pressed_cheese.ord+ggtitle("Pressed Cheese")) + plot_layout(guides = "collect")
+
+ggsave(filename = "supplemental_figure_3.png", plot = p_comb.ord, path = "~/OneDrive - Oregon State University/papers/variability_paper/for_publication/figures/supplementary/", width = 7.5, height = 6.5, dpi = 300)
+
+# Day Centroids
+### Milk
+p_raw.ord <- clr.pca(ps.raw, option = 2)
+p_raw.ord+ ggtitle("Raw Milk")
+
+p_hs_milk.ord <- clr.pca(ps.hs_milk, option = 2)
+p_hs_milk.ord+ ggtitle("Thermized Milk")
+
+p_vat.ord <- prune_samples(sample_names(ps.vat) != "B64", ps.vat) %>% clr.pca(option = 2)
+p_vat.ord+ ggtitle("Vat Milk")
+
+# Belts
+p_drain.ord <- clr.pca(ps.drain, option = 2)
+p_drain.ord+ ggtitle("Drain Belt")
+
+p_belt1.ord <- clr.pca(ps.belt1, option = 2)
+p_belt1.ord+ ggtitle("Belt 1")
+
+p_belt2.ord <- clr.pca(ps.belt2, option = 2)
+p_belt2.ord+ ggtitle("Belt 2")
+
+p_salter.ord <- clr.pca(ps.salter, option = 2)
+p_salter.ord+ ggtitle("salter")
+
+# Cheese
+p_pressed_cheese.ord <- clr.pca(ps.pressed_cheese, option = 2)
+p_pressed_cheese.ord+ ggtitle("Pressed Cheese")
+
+p_matted_curd.ord <- clr.pca(ps.matted_curd, option = 2)
+p_matted_curd.ord+ ggtitle("Matted Curd")
+
+# Figures arranged for publication
+
+p_comb.ord <- (p_raw.ord+ggtitle("Raw Milk") + p_hs_milk.ord+ggtitle("Thermized Milk") + p_vat.ord+ggtitle("Vat Milk")) / (p_drain.ord+ggtitle("Upper DMC Belt") + p_belt1.ord+ggtitle("Middle DMC Belt") + p_belt2.ord+ggtitle("Lower DMC Belt")) / (p_salter.ord+ggtitle("Salting Belt") + p_matted_curd.ord+ggtitle("Matted Curd") + p_pressed_cheese.ord+ggtitle("Pressed Cheese")) + plot_layout(guides = "collect")
+
+ggsave(filename = "Figure_4.tiff", plot = p_comb.ord, path = "~/OneDrive - Oregon State University/papers/variability_paper/for_publication/figures/main/", width = 7.5, height = 6.5, dpi = 300)
+
+p_raw.ord+theme(legend.position = )
+```
+
+
+
+## PERMDISP
+```{r}
+clr.group_disper <- function(x, a, b, c, method="euclidean", group1 = "facility", group2 = "day_char", option = 1){
+  #removes SVs not present in any samples and converts to relative abundance.
+  ps.clean <- prune_taxa(taxa_sums(x)>0, x) %>% transform(transform = "clr")
+  
+  meta <- data.frame(sample_data(x)) %>% rownames_to_column() %>% rename(sample = rowname)
+  disp <- betadisper(distance(ps.clean, method=method), group = meta[,group1])
+  anova <- anova(disp)
+  
+  nested_disper <- function(y, group2 = "day_char", abund = "TRUE"){
+    #removes SVs not present in any samples and converts to relative abundance.
+    ps.clean.day <- prune_taxa(taxa_sums(y)>0, y) %>% transform(transform = "clr") 
+    meta <- data.frame(sample_data(ps.clean.day)) %>% rownames_to_column() %>% rename(sample = rowname)
+    disp <- betadisper(distance(ps.clean.day, method=method), group = meta[,group2])
+    anova <- anova(disp)
+    
+    return(anova)
+  }
+  
+  anova_a <- nested_disper(y=a, group2 = group2, abund = abund)
+  anova_b <- nested_disper(y=b, group2 = group2, abund = abund)
+  anova_c <- nested_disper(y=c, group2 = group2, abund = abund)
+  
+  if(option == 1){
+  anova_table <- data.frame("Group" = c("Facility", "Day (Facility A)", "Day (Facility B)", "Day (Facility C)"), "p-values" = c(anova$`Pr(>F)`[1], anova_a$`Pr(>F)`[1], anova_b$`Pr(>F)`[1], anova_c$`Pr(>F)`[1]))
+  
+  return(anova_table)
+  }
+  
+  if(option == 2){
+  anova_table2 <- data.frame("Group" = c("Sample Type", "Location (Milk)", "Location (Betls)", "Location (Cheese)"), "p-values" = c(anova$`Pr(>F)`[1], anova_a$`Pr(>F)`[1], anova_b$`Pr(>F)`[1], anova_c$`Pr(>F)`[1]))
+
+  return(anova_table2)
+  }
+}
+
+## Milk
+clr.group_disper(x=ps.raw, a=ps.raw.A, b=ps.raw.B, c=ps.raw.C, method="euclidean", group1 = "facility", group2 = "day_char", option = 1)
+clr.group_disper(x=ps.hs_milk, a=ps.hs_milk.A, b=ps.hs_milk.B, c=ps.hs_milk.C, method="euclidean", group1 = "facility", group2 = "day_char", option = 1)
+clr.group_disper(x=prune_samples(sample_names(ps.vat) != "B64", ps.vat), a=ps.vat.A, b=prune_samples(sample_names(ps.vat.B) != "B64", ps.vat.B), c=ps.vat.C, method="euclidean", group1 = "facility", group2 = "day_char", option = 1)
+## Belts
+clr.group_disper(x=ps.drain, a=ps.drain.A, b=ps.drain.B, c=ps.drain.C, method="euclidean", group1 = "facility", group2 = "day_char", option = 1)
+clr.group_disper(x=ps.belt1, a=ps.belt1.A, b=ps.belt1.B, c=ps.belt1.C, method="euclidean", group1 = "facility", group2 = "day_char", option = 1)
+clr.group_disper(x=ps.belt2, a=ps.belt2.A, b=ps.belt2.B, c=ps.belt2.C, method="euclidean", group1 = "facility", group2 = "day_char", option = 1)
+clr.group_disper(x=ps.salter, a=ps.salter.A, b=ps.salter.B, c=ps.salter.C, method="euclidean", group1 = "facility", group2 = "day_char", option = 1)
+### Cheese
+clr.group_disper(x=ps.matted_curd, a=ps.matted_curd.A, b=ps.matted_curd.B, c=ps.matted_curd.C, method="euclidean", group1 = "facility", group2 = "day_char", option = 1)
+clr.group_disper(x=ps.pressed_cheese, a=ps.pressed_cheese.A, b=ps.pressed_cheese.B, c=ps.pressed_cheese.C, method="euclidean", group1 = "facility", group2 = "day_char", option = 1)
+```
+
+## PERMANOVA - mixed effects nested: facility (fixed), day (random & nested)
+```{r}
+clr.adonis <- function(x, option = 1){
+  x.clr <- transform(x, transform = "clr")
+  otu <- abundances(x.clr)
+  meta <- meta(x.clr)
+  if(option == 1){
+    result <- adonis2(t(otu)~facility*facility.day.location, method = "euclidean", data = meta)
+    return(result)
+  }
+  if(option == 2){
+    result2 <- adonis2(t(otu)~type*location*facility*facility.day, method = "euclidean", data = meta)
+    return(result2)
+  }
+}
+
+fun <- function(){
+  
+adonis.raw <- clr.adonis(ps.raw)
+adonis.hs_milk <- clr.adonis(ps.hs_milk)
+adonis.vat <- prune_samples(sample_names(ps.vat) != "B64", ps.vat) %>% clr.adonis()
+adonis.drain <- clr.adonis(ps.drain)
+adonis.belt1 <- clr.adonis(ps.belt1)
+adonis.belt2 <- clr.adonis(ps.belt2)
+adonis.salter <- clr.adonis(ps.salter)
+adonis.matted_curd <- clr.adonis(ps.matted_curd)
+adonis.pressed_cheese <- clr.adonis(ps.pressed_cheese)
+
+table <- data.frame("Sample Location" = c("Upper DMC Belt", "Middle DMC Belt", "Lower DMC Belt", " Salting Belt", "Raw Milk", "Thermized Milk", "Vat Milk", "Pressed Cheese", "Matted Curd"), "Facility.R2" = c(adonis.drain$R2[1],adonis.belt1$R2[1],adonis.belt2$R2[1],adonis.salter$R2[1],adonis.raw$R2[1],adonis.hs_milk$R2[1],adonis.vat$R2[1],adonis.pressed_cheese$R2[1],adonis.matted_curd$R2[1]), "Facility.Day.R2" = c(adonis.drain$R2[2],adonis.belt1$R2[2],adonis.belt2$R2[2],adonis.salter$R2[2],adonis.raw$R2[2],adonis.hs_milk$R2[2],adonis.vat$R2[2],adonis.pressed_cheese$R2[2],adonis.matted_curd$R2[2]), "Residual.R2" = c(adonis.drain$R2[3],adonis.belt1$R2[3],adonis.belt2$R2[3],adonis.salter$R2[3],adonis.raw$R2[3],adonis.hs_milk$R2[3],adonis.vat$R2[3],adonis.pressed_cheese$R2[3],adonis.matted_curd$R2[3]), "Facility.p.value" = c(adonis.drain$`Pr(>F)`[1],adonis.belt1$`Pr(>F)`[1],adonis.belt2$`Pr(>F)`[1],adonis.salter$`Pr(>F)`[1],adonis.raw$`Pr(>F)`[1],adonis.hs_milk$`Pr(>F)`[1],adonis.vat$`Pr(>F)`[1],adonis.pressed_cheese$`Pr(>F)`[1],adonis.matted_curd$`Pr(>F)`[1]), "Facility.Day.p.value" = c(adonis.drain$`Pr(>F)`[2],adonis.belt1$`Pr(>F)`[2],adonis.belt2$`Pr(>F)`[2],adonis.salter$`Pr(>F)`[2],adonis.raw$`Pr(>F)`[2],adonis.hs_milk$`Pr(>F)`[2],adonis.vat$`Pr(>F)`[2],adonis.pressed_cheese$`Pr(>F)`[2],adonis.matted_curd$`Pr(>F)`[2]))
+
+return(table)
+}
+
+adonis_table.clr <- fun()
+
+view(adonis_table.clr)
+```
+## PCA Loadings
+### Loadings for PC1 and PC2
+```{r}
+pca.loadings <- function(x, cutoff = 0.05){
+  x.clr <- prune_taxa(taxa_sums(x)>0, x) %>% transform(x, transform = "clr")
+  taxa <- as(tax_table(x.clr), "matrix") %>% data.frame() %>% rownames_to_column(var = "sequence")
+  taxa$Feature.SV <- paste(taxa$Feature, taxa$SV, sep = "_")
+  otu <- abundances(x.clr) %>% as.data.frame() %>% rownames_to_column(var = "sequence")
+  otu <- merge(taxa[,c(1,11)],otu)
+  otu <- otu[,-1] %>% column_to_rownames(var="Feature.SV") %>% as.matrix()
+  meta <- meta(x.clr)
+  pca <- prcomp(t(otu))
+  loadings <- data.frame(pca$rotation)
+  
+  load.var <- loadings[,c(1,2)] %>% rownames_to_column(var = "Feature.SV")
+  load.var <- merge(load.var,taxa[,c(9,10,11)])
+  load.var$pc1.var <- load.var$PC1^2
+  load.var$pc2.var <- load.var$PC2^2
+  
+  main.pc1 <- load.var[load.var$pc1.var >= cutoff,][,-c(3,7)]
+  main.pc1 <- main.pc1 %>% add_row(Feature.SV = "Other", Feature = "Other", SV = "Other", pc1.var = 1-sum(main.pc1$pc1.var))
+  main.pc1$location <- meta$location[1]
+  main.pc1$type <- meta$type[1]
+  
+  main.pc2 <- load.var[load.var$pc2.var >= cutoff,][,-c(2,6)]
+  main.pc2 <- main.pc2 %>% add_row(Feature.SV = "Other", Feature = "Other", SV = "Other", pc2.var = 1-sum(main.pc2$pc2.var))
+  main.pc2$location <- meta$location[1]
+  main.pc2$type <- meta$type[1]
+  
+  result <- list(load.var, main.pc1, main.pc2)
+
+  return(result)
+
+}
+
+# All sample locations - sample location and type listed in final tables doesnt mean anything. This function was written for per location assessment. Ignore both 'location' and 'type' in this case.
+loads.all <- prune_samples(sample_names(ps.decon.end.no_PMA) != "B64", ps.decon.end.no_PMA) %>% pca.loadings()
+
+# Milk
+loads.raw <- ps.raw %>% pca.loadings()
+loads.hs_milk <- ps.hs_milk %>% pca.loadings()
+loads.vat <- prune_samples(sample_names(ps.vat) != "B64", ps.vat) %>% pca.loadings()
+
+# Belts
+loads.drain <- ps.drain %>% pca.loadings()
+loads.belt1 <- ps.belt1 %>% pca.loadings()
+loads.belt2 <- ps.belt2 %>% pca.loadings()
+loads.salter <- ps.salter %>% pca.loadings()
+
+# Cheese
+loads.matted_curd <- ps.matted_curd %>% pca.loadings()
+loads.pressed_cheese <- ps.pressed_cheese %>% pca.loadings()
+
+loads.all.pc1 <- rbind(loads.raw[[2]],loads.hs_milk[[2]], loads.vat[[2]], loads.drain[[2]], loads.belt1[[2]], loads.belt2[[2]], loads.salter[[2]], loads.matted_curd[[2]], loads.pressed_cheese[[2]])
+
+loads.all.pc2 <- rbind(loads.raw[[3]],loads.hs_milk[[3]], loads.vat[[3]], loads.drain[[3]], loads.belt1[[3]], loads.belt2[[3]], loads.salter[[3]], loads.matted_curd[[3]], loads.pressed_cheese[[3]])
+
+loads.all.pc2[loads.all.pc2$Feature == "[Exiguobacteraceae]",]$Feature <- "Exiguobacteraceae"
+```
+
+### Dotplots showing proportion of explained variance for PC1 and PC2.
+```{r}
+loadings.dotplot <- function(x){
+  colnames(x)[5] <- "pc.var"
+  #order Features based on sum of contribution across all SVs of same type and place 'Other' at end.
+  feature.sum <- x %>% group_by(Feature) %>% summarise(sum = sum(pc.var)) %>% subset(Feature != "Other")
+  feature.levels <- feature.sum[order(feature.sum$sum),]$Feature
+  x$Feature <- factor(x$Feature, levels = c(feature.levels, "Other"))
+
+  p <- ggplot(x, aes(x=location, y=SV, size=pc.var, color = type))+ 
+    geom_point()+
+    facet_grid("Feature", scales = "free", space = "free", switch = "y", labeller = label_wrap_gen(9))+
+    scale_color_manual(values = c("#E84A2C", "#48BBD7", "#FDC000"))+
+    labs(size="Explained Variance", color="Sample Type", x="Sample Location", y= "Sequence Variants")+
+    theme(axis.text.x = element_text(angle = 90, hjust = 1), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), strip.text.y = element_text(size = 8), axis.text = element_text(size = 8), axis.title = element_text(size = 10), panel.background = element_blank(), axis.line = element_line(colour = "black"), strip.text.y.left = element_text(angle = 0), strip.placement = "outside")+scale_size(limits=c(0.01, 1), range = c(0.05,2.75))
+  
+  return(p)
+}
+
+p_loadings.pc1 <- loadings.dotplot(loads.all.pc1)+theme(axis.text.x = element_blank())+ggtitle("A")
+p_loadings.pc2 <- loadings.dotplot(loads.all.pc2)+ggtitle("B")
+
+
+p_loadings <- p_loadings.pc1 / p_loadings.pc2 + plot_layout(guides = "collect")
+
+ggsave(filename = "Figure_5.tiff", plot = p_loadings, path = "~/OneDrive - Oregon State University/papers/variability_paper/for_publication/figures/main/", width = 6.5, height = 7, dpi = 300)
+
+# different orientation
+
+p_loadings.pc1 <- loadings.dotplot(loads.all.pc1)+ggtitle("A")
+p_loadings.pc2 <- loadings.dotplot(loads.all.pc2)+ggtitle("B")
+
+p_loadings <- p_loadings.pc1 + p_loadings.pc2 + plot_layout(guides = "collect")&theme(legend.position = "bottom")
+
+ggsave(filename = "Figure_5-2.tiff", plot = p_loadings, path = "~/OneDrive - Oregon State University/papers/variability_paper/for_publication/figures/main/", width = 10, height = 5, dpi = 300)
+```
+
+## Centered Log-Ratios of SVs identified by PCA loadings.
+```{r}
+clr.plot <- function(x,y){
+  ps <- prune_taxa(taxa_sums(x)>0, x) %>% transform(transform = "clr")
+  df <- psmelt(ps)
+  df$facility <- factor(df$facility, levels = c("Facility A", "Facility B", "Facility C"))
+  df$Feature.SV <- paste(df$Feature, df$SV, sep = " ")
+  df$facility.day <- paste(df$facility, df$day_char)
+  
+  sv <- y[y$location == as.character(df$location[1]) & y$SV != "Other",]$SV
+  
+  sub.df <- df[df$SV %in% sv,]
+  
+  p <- ggplot(sub.df, aes(y=Abundance, x=facility.day, color = facility))+geom_boxplot()+facet_wrap("Feature.SV")+
+  labs(y = "", color = "Facility")+
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), panel.border = element_rect(colour = "black", fill=NA), strip.text = element_text(size = 7), axis.text.x = element_text(size = 7.5))+
+    scale_x_discrete(labels = c("D1", "D2", "D3", "D1", "D2", "D3", "D2", "D3"))+
+    scale_color_manual(values = c("#595959","#E84A2C", "#48BBD7"))+ylim(-1, 10.5)+labs(y="Center Log-Ratio", x = "Production Day")
+
+  return(p)
+}
+
+# Individual plots
+p_clr.plot.milk <- clr.plot(ps.hs_milk, loads.all.pc1)+ggtitle("A")
+p_clr.plot.drain <- clr.plot(ps.drain, loads.all.pc1)+ggtitle("C")
+p_clr.plot.cheese <- clr.plot(ps.pressed_cheese, loads.all.pc1)+ggtitle("B")
+
+p_clr.plot <- (p_clr.plot.milk+theme(legend.position = "none") | p_clr.plot.cheese+theme(legend.position = "none")) / (p_clr.plot.drain + plot_spacer()+plot_layout(widths = c(5,1)))+plot_layout(heights = c(1, 2.25))
+
+ggsave(filename = "Figure_6.tiff", path = "~/OneDrive - Oregon State University/papers/variability_paper/for_publication/figures/main/", plot = p_clr.plot, dpi = 300, width = 7.25, height = 5.75)
+
+clr.plot(ps.raw, loads.all.pc1)
+```
+
+#7. Taxonomic Analysis
+## Taxa Barplots
+```{r}
+fun <- function(x, x_axis = "replicate", facet = facility~day, data = FALSE, level = "Feature"){
+  
+  # transform sequence counts to relative abundance and filter taxa below the specified cutoff.
+  ps.rel <- x %>% transform(transform = "compositional") %>% filter_taxa(function(a) max(a) > 0.01, TRUE)
+  
+  # melt the filtered phyloseq object to be used with ggplot.
+  df <- psmelt(ps.rel)
+  
+  milk.sv <- df[df$type == "Milk" & df$Abundance >= 0.1,]$SV
+  other.sv <- df[df$type != "Milk" & df$Abundance > 0.01,]$SV
+  comb.sv <- c(milk.sv, other.sv) %>% unique()
+  
+  df.comb <- df[which(df$SV %in% comb.sv),]
+  
+  # create a new datatable containing only the columns that are important (easier to merge later on)
+  minimal <- data.frame("Abundance" = df.comb$Abundance, "location" = df.comb$location, "facility" = df.comb$facility, "time" = df.comb$time, "day" = df.comb$day_char, "replicate" = df.comb$replicate, "level" = df.comb[,level])
+  
+  # calculate the proportion of abundance that was associated with taxa below the cutoff and add it back to the dataset as 'Other'. 
+  remainder <- aggregate(minimal$Abundance, by = list(minimal$location, minimal$facility, minimal$day, minimal$replicate, minimal$time), sum) %>% rename(location = Group.1) %>% rename(facility = Group.2) %>% rename(day = Group.3) %>% rename(replicate = Group.4) %>% rename(time = Group.5)
+  remainder$Abundance <- 1-remainder$x
+  remainder$x <- NULL
+  remainder$level <- c("Other")
+  
+  # adding back the 'Other'
+  comb <- rbind(minimal, remainder)
+  
+  # scale_fill_manual ensures that all of the taxa are labelled the same on each plot.
+  p <- ggplot(comb, aes(y=Abundance, fill=reorder(level, -Abundance)))+geom_bar(stat = "identity", position = "stack", aes_string(x=x_axis))+facet_nested(facet)+ labs(y="Relative Abundance", x=x_axis, fill="Taxonomy")+theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),strip.text.y = element_text(angle = 0))+scale_fill_manual(values=c("#E84A2C","#F59B7C","#262626","#48BBD7","#00A187","#595959","#8390B6","#8FD1C2","#FDC000","#AF9D82","#3B528A","#7D6144"), breaks=c("Lactococcus","Other","Peptostreptococcaceae","Acinetobacter","Streptococcus","Clostridium","Lactobacillus","Enterococcus","Corynebacterium","Pseudomonas","Enterobacteriaceae","Halococcus"))
+  
+  return(p)
+}
+p_all.taxa <- fun(ps.decon.end.no_PMA, x_axis = "replicate", facet = location~facility+day)
+
+ggsave(filename = "Figure_7.tiff", plot = p_all.taxa, path = "~/OneDrive - Oregon State University/papers/variability_paper/for_publication/figures/main/", dpi = 300, width = 10, height = 6)
+```
+
+## Core Taxa
+```{r}
+core.milk <- core_taxa(ps.milk, prevelance = 0.90, merge_taxa = FALSE)
+core.belts <- core_taxa(ps.belts, prevelance = 0.90, merge_taxa = FALSE)
+core.cheese <- core_taxa(ps.cheese, prevelance = 0.90, merge_taxa = FALSE)
+```
+
+
+```{r}
+# Determine the mean relative abundance of taxa collapsed at a specific level.
+taxa_means <- function(x){
+  otu <- as(otu_table(x), "matrix")
+  sums <- colSums(otu)
+  result <- data.frame("mean" = mean(sums), "sd" = sd(sums))
+  
+  return(result)
+
+}
+
+
+# Milk comparisons
+ps.raw %>% transform_sample_counts(function(a) a / sum(a) ) %>% subset_taxa(Phylum == " p__Firmicutes") %>% taxa_means()
+ps.hs_milk %>% transform_sample_counts(function(a) a / sum(a) ) %>% subset_taxa(Phylum == " p__Firmicutes") %>% taxa_means()
+
+ps.raw %>% transform_sample_counts(function(a) a / sum(a) ) %>% subset_taxa(Class == " c__Gammaproteobacteria") %>% taxa_means()
+ps.hs_milk %>% transform_sample_counts(function(a) a / sum(a) ) %>% subset_taxa(Class == " c__Gammaproteobacteria") %>% taxa_means()
+
+# DMC Belt Comparison
+## Facility A
+### Acinetobacter
+ps.drain.A %>% transform_sample_counts(function(a) a / sum(a) ) %>% subset_taxa(Genus == " g__Acinetobacter") %>% taxa_means()
+ps.belt1.A %>% transform_sample_counts(function(a) a / sum(a) ) %>% subset_taxa(Genus == " g__Acinetobacter") %>% taxa_means()
+ps.belt2.A %>% transform_sample_counts(function(a) a / sum(a) ) %>% subset_taxa(Genus == " g__Acinetobacter") %>% taxa_means()
+
+ps.matted_curd.A %>% transform_sample_counts(function(a) a / sum(a) ) %>% subset_taxa(Genus == " g__Acinetobacter") %>% taxa_means()
+ps.pressed_cheese.A %>% transform_sample_counts(function(a) a / sum(a) ) %>% subset_taxa(Genus == " g__Acinetobacter") %>% taxa_means()
+
+### Enterobacteriaceae
+ps.drain.A %>% transform_sample_counts(function(a) a / sum(a) ) %>% subset_taxa(Family == " f__Enterobacteriaceae") %>% taxa_means()
+ps.belt1.A %>% transform_sample_counts(function(a) a / sum(a) ) %>% subset_taxa(Family == " f__Enterobacteriaceae") %>% taxa_means()
+ps.belt2.A %>% transform_sample_counts(function(a) a / sum(a) ) %>% subset_taxa(Family == " f__Enterobacteriaceae") %>% taxa_means()
+
+ps.belt2.A %>% transform_sample_counts(function(a) a / sum(a) ) %>% subset_taxa(Genus == " g__Lactococcus") %>% taxa_means()
+
+### Streptococcus
+ps.drain.A %>% transform_sample_counts(function(a) a / sum(a) ) %>% subset_taxa(Genus == " g__Streptococcus") %>% taxa_means()
+ps.belt1.A %>% transform_sample_counts(function(a) a / sum(a) ) %>% subset_taxa(Genus == " g__Streptococcus") %>% taxa_means()
+ps.belt2.A %>% transform_sample_counts(function(a) a / sum(a) ) %>% subset_taxa(Genus == " g__Streptococcus") %>% taxa_means()
+
+### Enterococcus
+ps.drain.A %>% transform_sample_counts(function(a) a / sum(a) ) %>% subset_taxa(Genus == " g__Enterococcus") %>% taxa_means()
+ps.belt1.A %>% transform_sample_counts(function(a) a / sum(a) ) %>% subset_taxa(Genus == " g__Enterococcus") %>% taxa_means()
+ps.belt2.A %>% transform_sample_counts(function(a) a / sum(a) ) %>% subset_taxa(Genus == " g__Enterococcus") %>% taxa_means()
+
+```
+
+```{r}
+taxa_means <- function(x, cutoff=0.01){
+  result <- prune_taxa(taxa_sums(x)>0, x) %>% transform_sample_counts(function(a) a / sum(a) ) %>% psmelt() %>% group_by(facility, location, Feature, day_char, replicate) %>% summarise(sum = sum(Abundance)) %>% group_by(facility, location, Feature) %>% summarise(mean = mean(sum), sd = sd(sum)) %>% subset(mean >= cutoff)
+  
+  return(result)
+}
+
+# Mean and standard deviation of relative sequence abundance, grouped by facility, location, and taxonomic feature.
+
+summary.milk <- taxa_means(ps.milk, cutoff = 0.01)
+summary.belt <- taxa_means(ps.belts, cutoff = 0.01)
+summary.cheese <- taxa_means(ps.cheese, cutoff = 0) %>% subset(mean > 0)
+
+# Taxonomic features present in Matted Curd but not Pressed Cheese by facility.
+
+setdiff(summary.cheese[summary.cheese$facility == "Facility A" & summary.cheese$location == "Matted Curd",]$Feature, summary.cheese[summary.cheese$facility == "Facility A" & summary.cheese$location == "Pressed Cheese",]$Feature)
+
+setdiff(summary.cheese[summary.cheese$facility == "Facility B" & summary.cheese$location == "Matted Curd",]$Feature, summary.cheese[summary.cheese$facility == "Facility B" & summary.cheese$location == "Pressed Cheese",]$Feature)
+
+setdiff(summary.cheese[summary.cheese$facility == "Facility C" & summary.cheese$location == "Matted Curd",]$Feature, summary.cheese[summary.cheese$facility == "Facility C" & summary.cheese$location == "Pressed Cheese",]$Feature)
+
+```
+
+#8. Cell Density
+## Import plate count data
+```{r}
+# all plate count data (tod and var studies)
+all_counts <- read_tsv("~/OneDrive - Oregon State University/r_code/til_facility_microbiome/post-qiime2/shared_files/plate_counts.txt")
+
+# rename variables and convert to factors
+all_counts$time <- factor(all_counts$time, levels=c("start", "middle", "end"))
+levels(all_counts$time) <- c("Start", "Middle", "End")
+all_counts$location <- factor(all_counts$location, levels=c("raw_milk", "heat-shock_milk", "vat_milk", "drain_belt", "belt_1", "belt_2", "salter_belt", "matted_curd", "pressed_cheese"))
+levels(all_counts$location) <- c("Raw Milk", "Thermized Milk", "Vat Milk", "Upper DMC Belt", "Middle DMC Belt", "Lower DMC Belt", "Salting Belt", "Matted Curd", "Pressed Cheese")
+all_counts$facility <- factor(all_counts$facility, levels=c("Tillamook", "Boardman_2", "Boardman_1"))
+levels(all_counts$facility) <- c("Facility A", "Facility B", "Facility C")
+
+# subset only var study
+eod_counts <- all_counts %>% subset(time == "End") %>% data.frame()
+eod_counts$type <- factor(eod_counts$type, levels = c("milk", "belt", "cheese"))
+levels(eod_counts$type) <- c("Milk", "Belts", "Cheese")
+```
+
+## Cell density by media type and facility
+```{r}
+# function for creating cell density plot 
+fun <- function(x){
+    # create table of mean values for plotting a line
+    mean_table <- x %>% group_by(type, facility, location) %>% summarize(mrs = mean(mrs), rogosa = mean(rogosa), enterococcus = mean(enterococcus), mac = mean(mac))
+    
+    gathered_counts <- gather(x[,-1], "media", "log_cfu", 7:10); gathered_counts$media <- factor(gathered_counts$media, levels = c("mrs", "rogosa", "enterococcus", "mac")); levels(gathered_counts$media) <- c("MRS", "SL", "m-EA", "MAC")
+    gathered_means <- gather(mean_table, "media", "log_cfu", 4:7); gathered_means$media <- factor(gathered_means$media, levels = c("mrs", "rogosa", "enterococcus", "mac")); levels(gathered_means$media) <- c("MRS", "SL", "m-EA", "MAC")
+
+    # generate plot
+    p <- ggplot()+ geom_point(data=gathered_counts, aes(x=location, y=log_cfu, color = facility), position = position_jitter(w = 0.1, h = 0))+ geom_line(data=gathered_means, aes(x=location, y=log_cfu, color = facility, group = facility))+facet_grid(media~type, scales = "free_x", space = "free_x")+labs(y="Culturable Cells, log(CFU/unit)", x="Sample Location", color="Facility")+ theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), panel.border = element_rect(colour = "black", fill=NA), axis.text.x = element_text(angle = 45, vjust = 1, hjust =1))+ ylim(-0.5, 9.5)+ scale_color_manual(values = c("#595959","#E84A2C", "#48BBD7"))
+    
+    return(p)
+}
+
+p_all.growth <- fun(eod_counts)
+p_all.growth
+
+ggsave(filename = "Figure_8.tiff", plot = p_all.growth, path = "~/OneDrive - Oregon State University/papers/variability_paper/for_publication/figures/main/", dpi = 300, height = 5, width = 8)
+
+eod_counts %>% group_by(facility, location) %>% summarise(mean_MRS = mean(mrs), sd_MRS = sd(mrs), mean_rogosa = mean(rogosa), sd_rogosa = sd(rogosa), mean_enterococcus = mean(enterococcus), sd_enterococcus = sd(enterococcus), mean_MAC = mean(mac), sd_MAC = sd(mac)) %>% View()
+
+kruskal.test(mrs~facility, data = eod_counts[eod_counts$location == "Thermized Milk",])
+kruskal.test(rogosa~facility, data = eod_counts[eod_counts$location == "Thermized Milk",])
+kruskal.test(enterococcus~facility, data = eod_counts[eod_counts$location == "Thermized Milk",])
+kruskal.test(mac~facility, data = eod_counts[eod_counts$location == "Thermized Milk",])
+```
+
+```{r}
+test <- ps.DMC %>% transform(transform = "compositional") %>% psmelt()
+test <- test[test$Abundance > 0 & test$facility == "Facility A",]
+
+write.csv(test, file = "~/OneDrive - Oregon State University/r_code/time_of_day_study/facility_A_DMC_SVs.csv")
+```
+
+# preliminary milk data
+```{r}
+df.prelim <- read_csv("~/OneDrive - Oregon State University/r_code/variability_study/all_preliminary.csv")
+df.prelim <- df.prelim[df.prelim$`Sample Location` == "Raw Milk" | df.prelim$`Sample Location` == "Milk to Vat",]
+df.prelim$`Sample Location` <- factor(df.prelim$`Sample Location`, levels = c("Raw Milk", "Milk to Vat"), labels = c("Raw Milk", "Thermized Milk"))
+df.prelim$Plant <- factor(df.prelim$Plant, levels = c("Tillamook", "Boardman 2", "Boardman 1"), labels = c("Facility A", "Facility B", "Facility C"))
+df.prelim <- df.prelim[df.prelim$`Cheese Type` == "Yellow Cheddar - R19" | df.prelim$`Sample Location` == "Raw Milk",]
+
+df.prelim <- df.prelim %>% rename(location = `Sample Location`) %>% rename(MRS = `MRS log(cfu/mL)`) %>% rename(MAC = `Coliforms log(cfu/mL)`)
+
+df.prelim <- df.prelim[!is.na(df.prelim$MRS),]
+
+ggplot(df.prelim, aes(x=location, y=MRS, color = Plant))+geom_boxplot()+theme_classic()+labs(x="Sample Location", y = "Culturable Cells, log(CFU/mL)", color = "Facility")+scale_color_manual()
+
+kruskal.test(MRS~Plant, data = df.prelim[df.prelim$location == "Thermized Milk",])
+
+test <-  prune_taxa(taxa_sums(ps.decon)>0, ps.decon) %>% transform(transform = "compositional") %>% psmelt()
+write.csv(test, file = "~/OneDrive - Oregon State University/r_code/time_of_day_study/var_study-compositional.csv")
+test <-  prune_taxa(taxa_sums(ps.decon)>0, ps.decon) %>% transform(transform = "clr") %>% psmelt()
+write.csv(test, file = "~/OneDrive - Oregon State University/r_code/time_of_day_study/var_study-clr.csv")
+```
+
