@@ -1,5 +1,5 @@
 ---
-title: "Temporal and geographic variability in the cheese facility microbiome"
+title: "The Cheese Production Facility Microbiome Exhibits Temporal and Spatial Variability"
 author: "Jared Johnson"
 date: "10/13/2020"
 output: html_document
@@ -78,10 +78,7 @@ feature_level <- function(x){
   return(comb)
 }
 
-
 ```
-
-
 
 #3. Importing QIIME2 Artifacts & Making Phyloseq Object (uses qiime2R)
 QIIME2 artificats are loaded in to R using qiime2R and then converted into the appropriate formats to be merged into a single Phyloseq object.
